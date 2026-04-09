@@ -1,0 +1,39 @@
+# Swoole 高性能模式 Dockerfile
+# 基于 PHP 8.2 + Swoole 扩展
+
+FROM phpswoole/swoole:php8.2-alpine
+
+LABEL maintainer="Framework Team"
+LABEL description="Swoole HTTP Server - 高性能协程模式"
+
+# 设置工作目录
+WORKDIR /var/www/html
+
+# 安装系统依赖
+RUN apk add --no-cache \
+    mysql-client \
+    libzip-dev \
+    && docker-php-ext-install pdo_mysql zip
+
+# 复制 Composer 配置
+COPY composer.json ./
+
+# 安装 PHP 依赖
+RUN composer install --no-dev --optimize-autoloader --no-interaction --no-scripts
+
+# 复制应用代码
+COPY . .
+
+# 创建必要目录
+RUN mkdir -p storage/cache storage/logs \
+    && chmod -R 777 storage
+
+# 暴露端口
+EXPOSE 9501
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:9501/health || exit 1
+
+# 启动命令
+CMD ["php", "bin/server", "--host=0.0.0.0", "--port=9501"]

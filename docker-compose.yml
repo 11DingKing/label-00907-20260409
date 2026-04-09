@@ -1,0 +1,113 @@
+version: '3.8'
+
+services:
+  # MySQL 数据库
+  mysql:
+    image: mysql:8.0
+    platform: linux/amd64
+    container_name: framework_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: framework_test
+      MYSQL_USER: app
+      MYSQL_PASSWORD: app123
+    ports:
+      - "33067:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./backend/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - framework_network
+
+  # ============================================
+  # 模式一：Swoole 高性能模式（默认，推荐生产环境）
+  # ============================================
+  # 默认启动：docker-compose up --build
+  swoole:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.swoole
+    container_name: framework_swoole
+    ports:
+      - "9501:9501"
+    volumes:
+      - ./backend:/var/www/html
+      - swoole_vendor:/var/www/html/vendor
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_DATABASE: framework_test
+      DB_USERNAME: root
+      DB_PASSWORD: root
+      DB_CHARSET: utf8mb4
+      APP_ENV: production
+      SWOOLE_HOST: 0.0.0.0
+      SWOOLE_PORT: 9501
+      SWOOLE_WORKERS: 4
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - framework_network
+    # 无 profiles = 默认启动
+
+  # ============================================
+  # 模式二：传统 PHP-FPM 模式（开发调试）
+  # ============================================
+  # 启动命令：docker-compose --profile fpm up --build
+  php:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: framework_php
+    volumes:
+      - ./backend:/var/www/html
+      - php_vendor:/var/www/html/vendor
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_DATABASE: framework_test
+      DB_USERNAME: root
+      DB_PASSWORD: root
+      DB_CHARSET: utf8mb4
+      APP_ENV: development
+    depends_on:
+      mysql:
+        condition: service_healthy
+    networks:
+      - framework_network
+    profiles:
+      - fpm
+      - development
+
+  # Nginx Web 服务器（仅 FPM 模式需要）
+  nginx:
+    image: nginx:alpine
+    platform: linux/amd64
+    container_name: framework_nginx
+    ports:
+      - "9527:80"
+    volumes:
+      - ./backend:/var/www/html
+      - ./backend/nginx.conf:/etc/nginx/conf.d/default.conf
+    depends_on:
+      - php
+    networks:
+      - framework_network
+    profiles:
+      - fpm
+      - development
+
+volumes:
+  mysql_data:
+  php_vendor:
+  swoole_vendor:
+
+networks:
+  framework_network:
+    driver: bridge

@@ -1,0 +1,194 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * Swoole HTTP 服务器启动脚本
+ * 
+ * 用法：
+ *   php bin/server [选项]
+ * 
+ * 选项：
+ *   --host=<host>    监听地址（默认：0.0.0.0）
+ *   --port=<port>    监听端口（默认：9501）
+ *   --workers=<num>  Worker 进程数（默认：CPU 核心数）
+ *   --daemon         以守护进程模式运行
+ *   --help           显示帮助信息
+ * 
+ * 示例：
+ *   php bin/server                          # 默认启动
+ *   php bin/server --port=8080              # 指定端口
+ *   php bin/server --daemon                 # 后台运行
+ *   php bin/server --workers=4 --port=9501  # 指定 Worker 数和端口
+ */
+
+// 检查 Swoole 扩展
+if (!extension_loaded('swoole')) {
+    echo "\033[31m错误：未安装 Swoole 扩展\033[0m\n";
+    echo "请先安装 Swoole：pecl install swoole\n";
+    echo "或使用 Docker Swoole 镜像运行\n";
+    exit(1);
+}
+
+// 检查 PHP 版本
+if (PHP_VERSION_ID < 80000) {
+    echo "\033[31m错误：需要 PHP 8.0 或更高版本\033[0m\n";
+    exit(1);
+}
+
+// 定义根目录
+define('BASE_PATH', dirname(__DIR__));
+
+// 加载 Composer 自动加载
+require_once BASE_PATH . '/vendor/autoload.php';
+
+// 加载 .env 文件
+use Dotenv\Dotenv;
+use Framework\Core\Application;
+use Framework\Config\Config;
+use Framework\Exception\Handler;
+
+if (file_exists(BASE_PATH . '/.env')) {
+    $dotenv = Dotenv::createImmutable(BASE_PATH);
+    $dotenv->safeLoad();
+}
+
+// 解析命令行参数
+$options = getopt('', ['host::', 'port::', 'workers::', 'daemon', 'help']);
+
+// 显示帮助
+if (isset($options['help'])) {
+    echo <<<HELP
+\033[32mSwoole HTTP 服务器\033[0m
+
+用法：
+  php bin/server [选项]
+
+选项：
+  --host=<host>    监听地址（默认：0.0.0.0）
+  --port=<port>    监听端口（默认：9501）
+  --workers=<num>  Worker 进程数（默认：CPU 核心数）
+  --daemon         以守护进程模式运行
+  --help           显示帮助信息
+
+示例：
+  php bin/server                          # 默认启动
+  php bin/server --port=8080              # 指定端口
+  php bin/server --daemon                 # 后台运行
+  php bin/server --workers=4 --port=9501  # 指定 Worker 数和端口
+
+环境变量（可在 .env 文件中配置）：
+  SWOOLE_HOST      监听地址
+  SWOOLE_PORT      监听端口
+  SWOOLE_WORKERS   Worker 进程数
+  DB_HOST          数据库主机
+  DB_DATABASE      数据库名
+  ...
+
+HELP;
+    exit(0);
+}
+
+// 加载配置
+$config = Config::getInstance();
+$config->setBasePath(BASE_PATH);
+$config->setPath(BASE_PATH . '/config');
+$config->load();
+
+// 注册配置到容器
+use Framework\Core\Container;
+$container = Container::getInstance();
+$container->instance(Config::class, $config);
+
+// 配置参数（命令行 > 环境变量 > 配置文件 > 默认值）
+$host = $options['host'] ?? $config->get('swoole.host', '0.0.0.0');
+$port = (int)($options['port'] ?? $config->get('swoole.port', 9501));
+$workers = (int)($options['workers'] ?? $config->get('swoole.workers', 0));
+if ($workers <= 0) {
+    $workers = swoole_cpu_num();
+}
+$daemon = isset($options['daemon']);
+$appEnv = $config->get('app.env', 'production');
+
+// 创建应用实例
+$app = new Application(BASE_PATH);
+
+// 初始化 Logger
+use Framework\Log\Logger;
+use Framework\Database\Connection;
+$logger = Logger::getInstance();
+$logger->setPath(BASE_PATH . '/storage/logs');
+$logger->setLevel('debug');
+$container->instance(Logger::class, $logger);
+
+// 注册数据库连接（直接使用配置创建）
+$dbConfig = [
+    'host' => $config->get('database.host', $config->get('database.connections.mysql.host', 'localhost')),
+    'port' => $config->get('database.port', $config->get('database.connections.mysql.port', 3306)),
+    'database' => $config->get('database.database', $config->get('database.connections.mysql.database', '')),
+    'username' => $config->get('database.username', $config->get('database.connections.mysql.username', 'root')),
+    'password' => $config->get('database.password', $config->get('database.connections.mysql.password', '')),
+    'charset' => $config->get('database.charset', $config->get('database.connections.mysql.charset', 'utf8mb4')),
+];
+
+// 设置 Model 静态数据库配置（Swoole Worker 进程可直接使用）
+use Framework\Database\Model;
+use Framework\Database\ConnectionPool;
+Model::setDatabaseConfig($dbConfig);
+
+// 注册数据库连接池（Swoole 协程环境）
+$poolConfig = $config->get('database.pool', []);
+$pool = ConnectionPool::getInstance();
+$pool->setConfig(
+    $dbConfig,
+    $poolConfig['max_connections'] ?? 10,
+    $poolConfig['wait_timeout'] ?? 3.0
+);
+$container->instance(ConnectionPool::class, $pool);
+
+// 注册数据库连接工厂（每次请求创建新连接，避免协程间共享问题）
+$container->bind(Connection::class, function() use ($dbConfig) {
+    return new Connection($dbConfig);
+});
+
+// 设置异常处理器（开启调试模式以便查看错误详情）
+$debugMode = $config->get('app.debug', $appEnv !== 'production');
+$app->setExceptionHandler(new Handler($logger, $debugMode));
+
+// 获取路由器
+$router = $app->getRouter();
+
+// 加载路由
+$routeFiles = [
+    BASE_PATH . '/routes/api.php',
+    BASE_PATH . '/routes/web.php',
+];
+
+foreach ($routeFiles as $file) {
+    if (file_exists($file)) {
+        require_once $file;
+    }
+}
+
+// 显示启动信息
+echo "\033[32m";
+echo "╔══════════════════════════════════════════════════════════╗\n";
+echo "║           Swoole HTTP Server - 高性能协程模式            ║\n";
+echo "╠══════════════════════════════════════════════════════════╣\n";
+printf("║  监听地址: %-45s║\n", "{$host}:{$port}");
+printf("║  Worker 数: %-44s║\n", $workers);
+printf("║  运行模式: %-45s║\n", $daemon ? '守护进程' : '前台');
+printf("║  环境: %-49s║\n", $appEnv);
+echo "╚══════════════════════════════════════════════════════════╝\n";
+echo "\033[0m";
+
+if (!$daemon) {
+    echo "\n按 Ctrl+C 停止服务器\n\n";
+}
+
+// 启用 Swoole
+$app->enableSwoole($port, $host, [
+    'worker_num' => $workers,
+    'daemonize' => $daemon,
+    'log_file' => BASE_PATH . '/storage/logs/swoole.log',
+    'pid_file' => BASE_PATH . '/storage/swoole.pid',
+]);
